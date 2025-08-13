@@ -47,6 +47,10 @@ def load_prices_yf(ticker: str):
         cols = out.select_dtypes(include="number").columns.tolist()
     return out[cols]
 
+st.write("Cols:", list(df.columns))
+st.write(df.dtypes)
+st.write(df.head())
+
 ticker = st.text_input("Ticker", "TSLA")
 
 if st.button("Predict"):
