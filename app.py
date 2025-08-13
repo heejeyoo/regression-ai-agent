@@ -164,13 +164,47 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Align for display
+    # (6) Align for display — robust as-of + daily resample fallbacks
     price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
+    
+    # default: empty series on X's index
+    price_on_X = pd.Series(index=X.index, dtype=float)
+    
     if price_col:
-        price_on_X = raw[price_col].astype(float).reindex(X.index).ffill().bfill()
-    else:
-        price_on_X = pd.Series(index=X.index, dtype=float)
-    realized = realized_next_return(price_on_X)
+        # Ensure both sides are clean date indexes
+        raw_price = raw[price_col].astype(float).copy()
+        raw_price.index = pd.to_datetime(raw_price.index, errors="coerce").tz_localize(None).normalize()
+    
+        x_idx = pd.to_datetime(X.index, errors="coerce").tz_localize(None).normalize()
+    
+        # 1) Try simple exact-date reindex + fills
+        tmp = raw_price.reindex(x_idx).ffill().bfill()
+    
+        if tmp.dropna().empty:
+            # 2) As-of merge (maps each X date to the most recent raw date <= X date)
+            ps = raw_price.reset_index()
+            ps.columns = ["Date", "Price"]
+            xi = pd.DataFrame({"Date": x_idx})
+            asof = pd.merge_asof(
+                xi.sort_values("Date"),
+                ps.sort_values("Date"),
+                on="Date",
+                direction="backward",
+                tolerance=pd.Timedelta("14D"),
+            )
+            asof.set_index("Date", inplace=True)
+            price_on_X = asof["Price"].reindex(x_idx)
+    
+            if price_on_X.dropna().empty:
+                # 3) Last fallback: daily resample the raw series and align
+                daily = raw_price.asfreq("D").ffill().bfill()
+                price_on_X = daily.reindex(x_idx).ffill().bfill()
+        else:
+            price_on_X = tmp
+    
+    # Realized next-day return from the aligned price series
+    realized = price_on_X.pct_change().shift(-1)
+
 
     # (7) Display
     st.subheader(f"Prediction for {ticker}")
