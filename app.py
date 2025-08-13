@@ -201,15 +201,37 @@ if st.button("Predict"):
     core_cols = ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]
     feats_df = strict if varscore(strict, core_cols) >= varscore(lenient, core_cols) else lenient
 
-    # --- Stash the exact price on the SAME index as feats_df ---
+    # --- Stash the exact price used to build features on the SAME index ---
     price_col0 = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
+    feats_index_norm = pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
+    
     if price_col0 is not None:
         base = pd.to_numeric(raw[price_col0], errors="coerce").copy()
         base.index = pd.to_datetime(base.index, errors="coerce").tz_localize(None).normalize()
-        fi = pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
-        feats_df["__price__"] = base.reindex(fi).ffill().bfill().values
+        aligned_price = base.reindex(feats_index_norm).ffill().bfill()
+        feats_df["__price__"] = aligned_price.values
     else:
         feats_df["__price__"] = np.nan
+    
+    # If stashed price is still all NaN, synthesize from returns (guaranteed non-NaN)
+    if feats_df["__price__"].isna().all():
+        ret = pd.to_numeric(feats_df.get("ret_1d"), errors="coerce")
+        # Choose an anchor from raw prices if possible, else 100.0
+        anchor = 100.0
+        if price_col0 is not None:
+            rp = pd.to_numeric(raw[price_col0], errors="coerce").dropna()
+            if not rp.empty:
+                first_dt = feats_index_norm.min()
+                prev = rp.loc[rp.index <= first_dt]
+                if not prev.empty:
+                    anchor = float(prev.iloc[-1])
+        if ret is not None and not ret.dropna().empty:
+            growth = (1.0 + ret.fillna(0.0)).cumprod()
+            synth = (growth / growth.iloc[0]) * anchor
+            feats_df["__price__"] = synth.values
+        else:
+            feats_df["__price__"] = anchor  # flat but non-NaN
+
 
     # (3) Event scaffolding
     feats_df = add_event_scaffolding(feats_df)
@@ -250,9 +272,16 @@ if st.button("Predict"):
 
     # (5) Predict
     preds = model.predict(X)
+    if show_debug:
+    st.markdown("**Price diagnostics**")
+    st.write({
+        "raw_price_non_na": int(pd.to_numeric(raw[price_col0], errors="coerce").notna().sum()) if price_col0 else 0,
+        "stashed__price__non_na": int(pd.to_numeric(feats_df["__price__"], errors="coerce").notna().sum()),
+        "price_on_X_non_na": int(price_on_X.notna().sum())
+    })
 
-    # (6) Build display price (stashed → asof align → synthetic-from-returns)
-    price_on_X = build_plot_price(feats_df, X.index, raw)
+    # (6) Display price: use stashed price on X index (cannot be all NaN after Patch 1)
+    price_on_X = pd.to_numeric(feats_df.loc[X.index, "__price__"], errors="coerce")
     realized = price_on_X.pct_change().shift(-1)
 
     # (7) Display
