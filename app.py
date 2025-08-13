@@ -112,53 +112,6 @@ def add_event_scaffolding(df):
     df["is_event_day"]  = ((df["news_vol_z20"] > 1.5) | (df["sent_jump_z20"] > 1.5)).astype(int)
     return df
 
-def align_price_asof(raw_price: pd.Series, target_index: pd.Index) -> pd.Series:
-    rp = raw_price.copy()
-    rp.index = pd.to_datetime(rp.index, errors="coerce").tz_localize(None).normalize()
-    tx = pd.to_datetime(target_index, errors="coerce").tz_localize(None).normalize()
-    p = rp.reindex(tx).ffill().bfill()
-    if p.dropna().empty:
-        ps = pd.DataFrame({"Date": rp.index, "Price": rp.values}).sort_values("Date")
-        xi = pd.DataFrame({"Date": tx}).sort_values("Date")
-        asof = pd.merge_asof(xi, ps, on="Date", direction="backward", tolerance=pd.Timedelta("90D"))
-        p = asof.set_index("Date")["Price"].reindex(tx)
-        if p.dropna().empty:
-            daily = rp.asfreq("D").ffill().bfill()
-            p = daily.reindex(tx).ffill().bfill()
-    p.index = target_index
-    return p
-
-def build_plot_price(feats_df: pd.DataFrame, Xindex: pd.Index, raw: pd.DataFrame) -> pd.Series:
-    # 1) stashed __price__ on feats index
-    if "__price__" in feats_df.columns:
-        p = pd.to_numeric(feats_df["__price__"], errors="coerce").reindex(Xindex)
-        if not p.dropna().empty:
-            return p
-    # 2) robust as-of from raw
-    price_col = next((c for c in ("Adj Close","Close","Open") if c in raw.columns), None)
-    if price_col is not None:
-        raw_price = pd.to_numeric(raw[price_col], errors="coerce")
-        p2 = align_price_asof(raw_price, Xindex)
-        if not p2.dropna().empty:
-            return p2
-    # 3) synthetic from returns with anchor
-    ret = pd.to_numeric(feats_df.get("ret_1d"), errors="coerce")
-    if ret is None or ret.dropna().empty:
-        return pd.Series(100.0, index=Xindex)
-    anchor = 100.0
-    if price_col is not None:
-        rp = pd.to_numeric(raw[price_col], errors="coerce").dropna()
-        if not rp.empty:
-            first_dt = pd.to_datetime(feats_df.index.min(), errors="coerce")
-            try:
-                prev = rp.loc[rp.index <= first_dt].iloc[-1]
-                anchor = float(prev)
-            except Exception:
-                pass
-    growth = (1.0 + ret.fillna(0.0)).cumprod()
-    synth = (growth / growth.iloc[0]) * anchor if len(growth) else pd.Series(anchor, index=ret.index)
-    return synth.reindex(Xindex).ffill().bfill()
-
 def varscore(df, core_cols):
     cols = [c for c in core_cols if c in df.columns]
     if df.empty or not cols:
@@ -256,8 +209,53 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Build display price (stashed -> asof -> synthetic)
-    price_on_X = build_plot_price(feats_df, X.index, raw)
+    # (6) Build display price ON X.index with hard fallbacks
+    _price_col = next((c for c in ("Adj Close","Close","Open") if c in raw.columns), None)
+
+    # 6a) Start with stashed price if present
+    if "__price__" in feats_df.columns:
+        price_on_X = pd.to_numeric(feats_df["__price__"], errors="coerce").reindex(X.index)
+    else:
+        price_on_X = pd.Series(index=X.index, dtype=float)
+
+    # 6b) If still all NaN, try aligning raw directly to X.index
+    if price_on_X.dropna().empty and _price_col is not None:
+        rp = pd.to_numeric(raw[_price_col], errors="coerce").copy()
+        rp.index = pd.to_datetime(rp.index, errors="coerce").tz_localize(None).normalize()
+        xi = pd.to_datetime(X.index, errors="coerce").tz_localize(None).normalize()
+        aligned = rp.reindex(xi).ffill().bfill()
+        aligned.index = X.index
+        price_on_X = aligned
+
+    # 6c) If still all NaN, synthesize from returns on X.index with a real anchor
+    if price_on_X.dropna().empty:
+        if "ret_1d" not in feats_df.columns:
+            if _price_col is not None:
+                px = pd.to_numeric(raw[_price_col], errors="coerce")
+                px.index = pd.to_datetime(px.index, errors="coerce").tz_localize(None).normalize()
+                r_full = px.pct_change()
+                feats_df["ret_1d"] = r_full.reindex(
+                    pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
+                ).ffill().bfill().values
+            else:
+                feats_df["ret_1d"] = 0.0
+
+        anchor = 100.0
+        if _price_col is not None:
+            px = pd.to_numeric(raw[_price_col], errors="coerce").dropna()
+            if not px.empty:
+                first_x_dt = pd.to_datetime(X.index.min(), errors="coerce")
+                try:
+                    prev = px.loc[px.index <= first_x_dt].iloc[-1]
+                    anchor = float(prev)
+                except Exception:
+                    pass
+
+        r_on_X = pd.to_numeric(feats_df["ret_1d"], errors="coerce").reindex(X.index).fillna(0.0)
+        growth = (1.0 + r_on_X).cumprod()
+        price_on_X = (growth / growth.iloc[0]) * anchor
+
+    # realized next-day return from the aligned price series
     realized = price_on_X.pct_change().shift(-1)
 
     # (7) Display
