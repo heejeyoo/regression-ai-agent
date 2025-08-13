@@ -231,6 +231,23 @@ if st.button("Predict"):
             feats_df["__price__"] = synth.values
         else:
             feats_df["__price__"] = anchor  # flat but non-NaN
+    
+    # --- Price diagnostics (place this INSIDE the Predict block, after price_on_X is computed) ---
+    if show_debug:
+        st.markdown("**Price diagnostics**")
+        raw_non_na = 0
+        try:
+            price_col0  # ensure it's defined in this scope
+        except NameError:
+            price_col0 = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
+        if price_col0:
+            raw_non_na = int(pd.to_numeric(raw[price_col0], errors="coerce").notna().sum())
+    
+        st.write({
+            "raw_price_non_na": raw_non_na,
+            "stashed__price__non_na": int(pd.to_numeric(feats_df["__price__"], errors="coerce").notna().sum()) if "__price__" in feats_df.columns else 0,
+            "price_on_X_non_na": int(price_on_X.notna().sum()),
+        })
 
 
     # (3) Event scaffolding
