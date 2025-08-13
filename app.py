@@ -8,11 +8,11 @@ import yfinance as yf
 from utils import compute_indicators
 
 st.set_page_config(page_title="AI Stock Predictor", layout="wide")
-st.title("AI Stock Prediction App")
+st.title("📈 AI Stock Prediction App")
 st.caption("Educational demo -- not financial advice.")
 
 # ----------------- Robust Yahoo Finance loader -----------------
-def load_prices_yf(ticker: str, period: str = "1y"):
+def load_prices_yf(ticker: str, period: str = "2y"):
     df = yf.download(ticker, period=period, interval="1d", auto_adjust=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -29,17 +29,17 @@ def load_prices_yf(ticker: str, period: str = "1y"):
         "open":"Open", "high":"High", "low":"Low", "close":"Close", "volume":"Volume",
     })
 
-    # Deduplicate (keep first occurrence)
+    # Deduplicate (keep first)
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # Ensure fields exist
+    # Ensure fields
     if "Adj Close" not in df.columns and "Close" in df.columns:
         df["Adj Close"] = df["Close"]
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
 
-    # Coerce to numeric and force 1-D if needed
+    # Coerce to numeric, force 1-D if needed
     out = pd.DataFrame(index=df.index)
     for c in df.columns:
         s = df[c]
@@ -47,7 +47,6 @@ def load_prices_yf(ticker: str, period: str = "1y"):
             s = s.iloc[:, 0]
         out[c] = pd.to_numeric(s.squeeze(), errors="coerce")
 
-    # Keep canonical set if present
     cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in out.columns]
     if not cols:
         cols = out.select_dtypes(include="number").columns.tolist()
@@ -58,13 +57,14 @@ col1, col2 = st.columns([2,1])
 with col1:
     ticker = st.text_input("Ticker", "TSLA").strip().upper()
 with col2:
-    period = st.selectbox("History window", ["6mo","1y","2y","5y"], index=1)
+    period = st.selectbox("History window", ["1y","2y","5y","max"], index=1)
 
 if st.button("Predict"):
     # 1) Load & preprocess prices
     df = load_prices_yf(ticker, period=period)
     if df.empty:
-        st.error("No price data returned for that ticker/period."); st.stop()
+        st.error("No price data returned for that ticker/period.")
+        st.stop()
 
     df = compute_indicators(df)  # robust 1-D safe indicators from utils.py
 
@@ -89,7 +89,7 @@ if st.button("Predict"):
     df["sent_jump_z20"] = zscore(df["sent_jump"])
     df["is_event_day"]  = ((df["news_vol_z20"] > 1.5) | (df["sent_jump_z20"] > 1.5)).astype(int)
 
-    # 4) Ensure all expected feature columns exist; fill NaNs/inf
+    # 4) Ensure feature columns; fill NaNs/±inf (NO hard warm-up trim)
     for c in features:
         if c not in df.columns:
             df[c] = 0.0
@@ -97,14 +97,11 @@ if st.button("Predict"):
     X = (df[features]
          .astype(float)
          .replace([np.inf, -np.inf], np.nan)
+         .fillna(method="ffill")
          .fillna(0.0))
 
-    # Trim initial warm-up rows from rolling windows
-    if len(X) > 30:
-        X = X.iloc[30:]
-
     if X.empty:
-        st.error("No rows with complete feature data to predict. Try a longer history (e.g., 2y).")
+        st.error("No rows with complete feature data to predict. Try a longer history (e.g., 2y or 5y).")
         st.stop()
 
     # 5) Predict next-day returns
@@ -119,10 +116,9 @@ if st.button("Predict"):
     st.subheader(f"Prediction for {ticker}")
     st.line_chart(chart)
 
-    # Latest point
     latest_dt = X.index[-1]
     latest_pred = float(preds[-1])
     st.metric(
-        label=f"Latest predicted next-day return ({latest_dt.date()})",
+        label=f"Latest predicted next-day return ({getattr(latest_dt, 'date', lambda: latest_dt)()})",
         value=f"{latest_pred:.2%}"
     )
