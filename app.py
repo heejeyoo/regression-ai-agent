@@ -1,14 +1,14 @@
 # app.py — Diagnostics-first Streamlit app (robust pull → align → process → display)
+# Ensures a non-NaN price series via stashed price → asof align → synthetic-from-returns
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import yfinance as yf
+import joblib, yfinance as yf
 from utils import compute_indicators  # your 1-D safe version
 
 st.set_page_config(page_title="AI Stock Predictor — Diagnostics", layout="wide")
-st.title("📈 AI Stock Predictor — Diagnostics")
+st.title("AI Stock Predictor — Diagnostics")
 st.caption("Educational demo - not financial advice.")
 
 # ---------- Helpers ----------
@@ -55,7 +55,12 @@ def load_prices_yf(ticker: str, period: str = "5y"):
     keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in out.columns]
     if not keep:
         keep = out.select_dtypes(include="number").columns.tolist()
-    return _as_date_index(out[keep])
+    out = _as_date_index(out[keep])
+    # Drop days where all OHLC are NaN (rare YF edge cases)
+    if {"Open","High","Low","Close"}.issubset(out.columns):
+        mask_any = out[["Open","High","Low","Close"]].notna().any(axis=1)
+        out = out.loc[mask_any]
+    return out
 
 def build_indicators_lenient(raw: pd.DataFrame) -> pd.DataFrame:
     # EWMs + min_periods=2 so features always vary
@@ -106,25 +111,67 @@ def add_event_scaffolding(df):
     df["is_event_day"]  = ((df["news_vol_z20"] > 1.5) | (df["sent_jump_z20"] > 1.5)).astype(int)
     return df
 
-def get_display_price(raw: pd.DataFrame, feats_index) -> pd.Series:
-    # derive price exactly on features' dates (robust to tz/holidays)
-    price_col = next((c for c in ("Adj Close", "Close", "Open") if c in raw.columns), None)
-    if price_col is None:
-        return pd.Series(index=feats_index, dtype=float)
+def align_price_asof(raw_price: pd.Series, target_index: pd.Index) -> pd.Series:
+    rp = raw_price.copy()
+    rp.index = pd.to_datetime(rp.index, errors="coerce").tz_localize(None).normalize()
+    tx = pd.to_datetime(target_index, errors="coerce").tz_localize(None).normalize()
+    # direct reindex
+    p = rp.reindex(tx).ffill().bfill()
+    if p.dropna().empty:
+        # asof within large tolerance
+        ps = pd.DataFrame({"Date": rp.index, "Price": rp.values}).sort_values("Date")
+        xi = pd.DataFrame({"Date": tx}).sort_values("Date")
+        asof = pd.merge_asof(xi, ps, on="Date", direction="backward", tolerance=pd.Timedelta("90D"))
+        p = asof.set_index("Date")["Price"].reindex(tx)
+        if p.dropna().empty:
+            # daily resample
+            daily = rp.asfreq("D").ffill().bfill()
+            p = daily.reindex(tx).ffill().bfill()
+    p.index = target_index
+    return p
 
-    p = pd.to_numeric(raw[price_col], errors="coerce").copy()
-    p.index = pd.to_datetime(p.index, errors="coerce")
-    p.index = pd.DatetimeIndex(p.index.tz_localize(None)).normalize()
+def build_plot_price(feats_df: pd.DataFrame, Xindex: pd.Index, raw: pd.DataFrame) -> pd.Series:
+    """Return a price series aligned to Xindex via 3 fallbacks:
+       1) stashed __price__, 2) as-of alignment from raw, 3) synthetic from returns."""
+    # 1) Stashed price (preferred)
+    if "__price__" in feats_df.columns:
+        p = pd.to_numeric(feats_df["__price__"], errors="coerce").reindex(Xindex)
+        if not p.dropna().empty:
+            return p
 
-    x_idx = pd.to_datetime(feats_index, errors="coerce")
-    x_idx = pd.DatetimeIndex(x_idx.tz_localize(None)).normalize()
+    # 2) Robust as-of alignment from raw
+    price_col = next((c for c in ("Adj Close","Close","Open") if c in raw.columns), None)
+    if price_col is not None:
+        raw_price = pd.to_numeric(raw[price_col], errors="coerce")
+        p2 = align_price_asof(raw_price, Xindex)
+        if not p2.dropna().empty:
+            return p2
 
-    aligned = p.reindex(x_idx).ffill().bfill()
-    aligned.index = feats_index
-    return aligned
+    # 3) Synthetic price from returns with real anchor (or 100.0)
+    ret = pd.to_numeric(feats_df.get("ret_1d"), errors="coerce")
+    if ret is None or ret.dropna().empty:
+        # totally last resort
+        return pd.Series(100.0, index=Xindex)
 
-def realized_next_return(price_series: pd.Series) -> pd.Series:
-    return price_series.pct_change().shift(-1)
+    # Anchor = raw price as-of the first feature date, else 100.0
+    anchor = 100.0
+    if price_col is not None:
+        rp = pd.to_numeric(raw[price_col], errors="coerce").dropna()
+        if not rp.empty:
+            first_dt = pd.to_datetime(feats_df.index.min(), errors="coerce")
+            try:
+                prev = rp.loc[rp.index <= first_dt].iloc[-1]
+                anchor = float(prev)
+            except Exception:
+                # if as-of lookup fails, keep 100.0
+                pass
+
+    # Build synthetic price path
+    # Price_t = anchor * cumprod_{i<=t} (1 + ret_i), aligned to feats index then subset to Xindex
+    growth = (1.0 + ret.fillna(0.0)).cumprod()
+    synth = (growth / growth.iloc[0]) * anchor if len(growth) else pd.Series(anchor, index=ret.index)
+    synth = synth.reindex(Xindex).ffill().bfill()
+    return synth
 
 def varscore(df, core_cols):
     cols = [c for c in core_cols if c in df.columns]
@@ -154,15 +201,13 @@ if st.button("Predict"):
     core_cols = ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]
     feats_df = strict if varscore(strict, core_cols) >= varscore(lenient, core_cols) else lenient
 
-    # --- Stash the exact price used to build features on the SAME index ---
-    price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
-    if price_col is not None:
-        price_used = pd.to_numeric(raw[price_col], errors="coerce").copy()
-        # normalize both to tz-naive daily dates
-        price_used.index = pd.to_datetime(price_used.index, errors="coerce").tz_localize(None).normalize()
-        feats_idx = pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
-        aligned_price = price_used.reindex(feats_idx).ffill().bfill()
-        feats_df["__price__"] = aligned_price.values  # same length/order as feats_df
+    # --- Stash the exact price on the SAME index as feats_df ---
+    price_col0 = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
+    if price_col0 is not None:
+        base = pd.to_numeric(raw[price_col0], errors="coerce").copy()
+        base.index = pd.to_datetime(base.index, errors="coerce").tz_localize(None).normalize()
+        fi = pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
+        feats_df["__price__"] = base.reindex(fi).ffill().bfill().values
     else:
         feats_df["__price__"] = np.nan
 
@@ -193,13 +238,12 @@ if st.button("Predict"):
 
     core_in = [f for f in core_cols if f in X.columns]
     if core_in:
-        # gentle fill for core, then drop rows still all-NaN across core
         X[core_in] = X[core_in].ffill().bfill()
         mask = ~X[core_in].isna().all(axis=1)
         X = X.loc[mask]
 
-    # last-row fallback so we never end empty
     if X.empty:
+        # last-row fallback so we never end empty
         last_row = feats_df.iloc[[-1]][features].copy()
         last_row = last_row.replace([np.inf, -np.inf], np.nan).ffill(axis=1).bfill(axis=1).fillna(0.0)
         X = last_row
@@ -207,12 +251,9 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Align for display — use the stashed feature-aligned price
-    price_on_X = pd.to_numeric(feats_df.loc[X.index, "__price__"], errors="coerce")
+    # (6) Build display price (stashed → asof align → synthetic-from-returns)
+    price_on_X = build_plot_price(feats_df, X.index, raw)
     realized = price_on_X.pct_change().shift(-1)
-    
-    if price_on_X.dropna().empty:
-        st.error("Price still empty after stashing. Check YF data availability and logs.")
 
     # (7) Display
     st.subheader(f"Prediction for {ticker}")
@@ -249,16 +290,13 @@ if st.button("Predict"):
         st.markdown("**Alignment & variance summary**")
         st.write(diag_alignment)
 
-        try:
-            example_core = [c for c in core_cols if c in feats_df.columns][:6]
-            st.markdown("**Core feature head/tail (chosen set)**")
-            if example_core:
-                st.write("Head:", feats_df[example_core].head(3))
-                st.write("Tail:", feats_df[example_core].tail(3))
-            else:
-                st.write("Chosen features head:", feats_df.head(3))
-        except Exception:
-            pass
+        example_core = [c for c in core_cols if c in feats_df.columns][:6]
+        st.markdown("**Core feature head/tail (chosen set)**")
+        if example_core:
+            st.write("Head:", feats_df[example_core].head(3))
+            st.write("Tail:", feats_df[example_core].tail(3))
+        else:
+            st.write("Chosen features head:", feats_df.head(3))
 
         missing = sorted(set(features) - set(feats_df.columns))
         extra   = sorted(set(feats_df.columns) - set(features))
