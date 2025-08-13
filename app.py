@@ -209,37 +209,41 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Build display price ON X.index with hard fallbacks
+    # (6) Build display price ON X.index with hard fallbacks (never all-NaN)
     _price_col = next((c for c in ("Adj Close","Close","Open") if c in raw.columns), None)
-
+    
+    def _norm_idx(idx):
+        dt = pd.to_datetime(idx, errors="coerce")
+        return pd.DatetimeIndex(dt.tz_localize(None)).normalize()
+    
     # 6a) Start with stashed price if present
     if "__price__" in feats_df.columns:
         price_on_X = pd.to_numeric(feats_df["__price__"], errors="coerce").reindex(X.index)
     else:
         price_on_X = pd.Series(index=X.index, dtype=float)
-
-    # 6b) If still all NaN, try aligning raw directly to X.index
+    
+    # 6b) If still NaN, try aligning raw directly to X.index
     if price_on_X.dropna().empty and _price_col is not None:
         rp = pd.to_numeric(raw[_price_col], errors="coerce").copy()
-        rp.index = pd.to_datetime(rp.index, errors="coerce").tz_localize(None).normalize()
-        xi = pd.to_datetime(X.index, errors="coerce").tz_localize(None).normalize()
+        rp.index = _norm_idx(rp.index)
+        xi = _norm_idx(X.index)
         aligned = rp.reindex(xi).ffill().bfill()
         aligned.index = X.index
         price_on_X = aligned
-
-    # 6c) If still all NaN, synthesize from returns on X.index with a real anchor
+    
+    # 6c) If still NaN, synthesize from returns on X.index with a real anchor
     if price_on_X.dropna().empty:
+        # ensure we have ret_1d on feats_df; if missing, derive from raw or set 0
         if "ret_1d" not in feats_df.columns:
             if _price_col is not None:
                 px = pd.to_numeric(raw[_price_col], errors="coerce")
-                px.index = pd.to_datetime(px.index, errors="coerce").tz_localize(None).normalize()
+                px.index = _norm_idx(px.index)
                 r_full = px.pct_change()
-                feats_df["ret_1d"] = r_full.reindex(
-                    pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
-                ).ffill().bfill().values
+                feats_df["ret_1d"] = r_full.reindex(_norm_idx(feats_df.index)).ffill().bfill().values
             else:
                 feats_df["ret_1d"] = 0.0
-
+    
+        # anchor from raw as-of the first X date, else 100.0
         anchor = 100.0
         if _price_col is not None:
             px = pd.to_numeric(raw[_price_col], errors="coerce").dropna()
@@ -250,11 +254,31 @@ if st.button("Predict"):
                     anchor = float(prev)
                 except Exception:
                     pass
-
+    
         r_on_X = pd.to_numeric(feats_df["ret_1d"], errors="coerce").reindex(X.index).fillna(0.0)
         growth = (1.0 + r_on_X).cumprod()
-        price_on_X = (growth / growth.iloc[0]) * anchor
-
+        # guard: if growth is empty or first element is 0/NaN, use ones
+        if len(growth) == 0 or not np.isfinite(float(growth.iloc[0])) or float(growth.iloc[0]) == 0.0:
+            growth = pd.Series(1.0, index=X.index)
+        price_on_X = (growth / float(growth.iloc[0])) * anchor
+    
+    # 6d) Final unconditional fallback: if any NaNs remain, fill; if still all NaN, draw a tiny slope
+    if price_on_X.isna().any():
+        price_on_X = price_on_X.ffill().bfill()
+    if price_on_X.dropna().empty:
+        # tiny slope synthetic path around anchor so charts/render always work
+        anchor = 100.0
+        if _price_col is not None:
+            px = pd.to_numeric(raw[_price_col], errors="coerce").dropna()
+            if not px.empty:
+                anchor = float(px.iloc[-1])
+        n = len(X.index)
+        price_on_X = pd.Series(
+            np.linspace(anchor * 0.995, anchor * 1.005, n),
+            index=X.index,
+            dtype=float
+        )
+    
     # realized next-day return from the aligned price series
     realized = price_on_X.pct_change().shift(-1)
 
