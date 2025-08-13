@@ -1,5 +1,5 @@
-# app.py — Diagnostics-first Streamlit app (pull → align → process → display)
-# ASCII-only comments/strings to avoid unicode parser issues.
+# app.py - Diagnostics-first Streamlit app (pull -> align -> process -> display)
+# ASCII-only to avoid parser issues.
 
 import streamlit as st
 import pandas as pd
@@ -8,8 +8,8 @@ import joblib
 import yfinance as yf
 from utils import compute_indicators  # your 1-D safe version
 
-st.set_page_config(page_title="AI Stock Predictor — Diagnostics", layout="wide")
-st.title("📈 AI Stock Predictor — Diagnostics")
+st.set_page_config(page_title="AI Stock Predictor - Diagnostics", layout="wide")
+st.title("AI Stock Predictor - Diagnostics")
 st.caption("Educational demo - not financial advice.")
 
 # ---------- Helpers ----------
@@ -276,7 +276,7 @@ if st.button("Predict"):
         label_date = str(latest_dt)
     st.metric(label=f"Latest predicted next-day return ({label_date})", value=f"{latest_pred:.2%}")
 
-    # (8) Diagnostics (including price diagnostics) -------------------------
+    # (8) Diagnostics (including price diagnostics)
     if show_debug:
         st.subheader("Diagnostics")
 
@@ -292,11 +292,11 @@ if st.button("Predict"):
             "varscore_strict": varscore(strict, core_cols),
             "varscore_lenient": varscore(lenient, core_cols),
         }
-        st.markdown("**Alignment & variance summary**")
+        st.markdown("Alignment and variance summary")
         st.write(diag_alignment)
 
         example_core = [c for c in core_cols if c in feats_df.columns][:6]
-        st.markdown("**Core feature head/tail (chosen set)**")
+        st.markdown("Core feature head/tail (chosen set)")
         if example_core:
             st.write("Head:", feats_df[example_core].head(3))
             st.write("Tail:", feats_df[example_core].tail(3))
@@ -305,7 +305,7 @@ if st.button("Predict"):
 
         missing = sorted(set(features) - set(feats_df.columns))
         extra   = sorted(set(feats_df.columns) - set(features))
-        st.markdown("**Feature coverage**")
+        st.markdown("Feature coverage")
         st.write({
             "expected_features": int(len(features)),
             "missing_in_current": int(len(missing)),
@@ -314,7 +314,7 @@ if st.button("Predict"):
         if missing:
             st.caption("Missing (first 20): " + ", ".join(missing[:20]))
 
-        st.markdown("**NaN report on X (first 15)**")
+        st.markdown("NaN report on X (first 15)")
         nan_counts = X.isna().sum()
         nan_counts = nan_counts[nan_counts > 0].sort_values(ascending=False)
         if nan_counts.empty:
@@ -322,7 +322,7 @@ if st.button("Predict"):
         else:
             st.write(nan_counts.head(15))
 
-        st.markdown("**Prediction summary**")
+        st.markdown("Prediction summary")
         st.write({
             "pred_mean": float(np.mean(preds)),
             "pred_std": float(np.std(preds)),
@@ -330,13 +330,13 @@ if st.button("Predict"):
             "pred_max": float(np.max(preds)),
         })
 
-        # Price diagnostics (this block is intentionally indented and uses only ASCII)
-        st.markdown("**Price diagnostics**")
+        # Price diagnostics
+        st.markdown("Price diagnostics")
         pc = next((c for c in ("Adj Close","Close","Open") if c in raw.columns), None)
         raw_non_na = int(pd.to_numeric(raw[pc], errors="coerce").notna().sum()) if pc else 0
         st.write({
             "raw_price_non_na": raw_non_na,
-            "stashed__price__non_na": int(pd.to_numeric(feats_df.get(\"__price__\"), errors=\"coerce\").notna().sum()) if \"__price__\" in feats_df.columns else 0,
+            "stashed__price__non_na": int(pd.to_numeric(feats_df.get("__price__"), errors="coerce").notna().sum()) if "__price__" in feats_df.columns else 0,
             "price_on_X_non_na": int(price_on_X.notna().sum()),
         })
 
@@ -345,7 +345,7 @@ if st.button("Predict"):
                 {"Price": price_on_X, "Pred_next_ret": preds, "Realized_next_ret": realized},
                 index=X.index
             )
-            st.markdown("**Debug table (last 10 rows)**")
+            st.markdown("Debug table (last 10 rows)")
             st.dataframe(dbg.tail(10).style.format({
                 "Price": "{:,.2f}",
                 "Pred_next_ret": "{:.3%}",
