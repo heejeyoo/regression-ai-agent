@@ -191,24 +191,69 @@ if st.button("Predict"):
         label_date = str(latest_dt)
     st.metric(label=f"Latest predicted next-day return ({label_date})", value=f"{latest_pred:.2%}")
 
-    # ============ 8) Diagnostics panel ============
-    if show_debug:
-        st.subheader("Diagnostics 🔍")
 
-        # Shapes & index alignment
-        st.markdown("**Alignment summary**")
-        st.write({
-            "raw_rows": int(len(raw)),
-            "ind_rows": int(len(ind)),
-            "X_rows": int(len(X)),
-            "first_X": str(X.index.min().date()) if len(X) else None,
-            "last_X": str(X.index.max().date()) if len(X) else None,
-            "price_aligned_non_na": int(price_on_X.notna().sum())
-        })
+  # ============ 8) Diagnostics panel ============
+if show_debug:
+    st.subheader("Diagnostics 🔍")
 
-        # Feature coverage
-        missing = sorted(set(features) - set(ind.columns))
-        extra   = sorted(set(ind.columns) - set(features))
-        st.markdown("**Feature coverage**")
-        st.write({
-            "expected_fea_
+    # Alignment summary
+    diag_alignment = {
+        "raw_rows": int(len(raw)),
+        "ind_rows": int(len(ind)),
+        "X_rows": int(len(X)),
+        "first_X": str(X.index.min().date()) if len(X) else None,
+        "last_X": str(X.index.max().date()) if len(X) else None,
+        "price_aligned_non_na": int(price_on_X.notna().sum()),
+    }
+    st.markdown("**Alignment summary**")
+    st.write(diag_alignment)
+
+    # Feature coverage
+    missing = sorted(set(features) - set(ind.columns))
+    extra   = sorted(set(ind.columns) - set(features))
+    diag_features = {
+        "expected_features": int(len(features)),
+        "missing_in_current": int(len(missing)),
+        "extra_in_current": int(len(extra)),
+    }
+    st.markdown("**Feature coverage**")
+    st.write(diag_features)
+    if missing:
+        st.caption("Missing (first 20): " + ", ".join(missing[:20]))
+
+    # NaN report
+    st.markdown("**NaN report on X (first 15 with NaNs)**")
+    nan_counts = X.isna().sum()
+    nan_counts = nan_counts[nan_counts > 0].sort_values(ascending=False)
+    if nan_counts.empty:
+        st.write("No NaNs in X after imputing.")
+    else:
+        st.write(nan_counts.head(15))
+
+    # Prediction summary
+    st.markdown("**Prediction summary**")
+    pred_summary = {
+        "pred_mean": float(np.mean(preds)),
+        "pred_std": float(np.std(preds)),
+        "pred_min": float(np.min(preds)),
+        "pred_max": float(np.max(preds)),
+    }
+    st.write(pred_summary)
+
+    # Debug table & download
+    try:
+        dbg = pd.DataFrame(
+            {"Price": price_on_X, "Pred_next_ret": preds, "Realized_next_ret": realized},
+            index=X.index
+        )
+        st.markdown("**Debug table (last 10 rows)**")
+        st.dataframe(dbg.tail(10).style.format({
+            "Price": "{:,.2f}",
+            "Pred_next_ret": "{:.3%}",
+            "Realized_next_ret": "{:.3%}",
+        }))
+        csv = dbg.to_csv(index=True).encode("utf-8")
+        st.download_button("Download debug_export.csv", data=csv, file_name="debug_export.csv", mime="text/csv")
+    except Exception as e:
+        st.info(f"Could not build debug table: {e}")
+
