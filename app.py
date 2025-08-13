@@ -289,13 +289,13 @@ if st.button("Predict"):
 
     # (5) Predict
     preds = model.predict(X)
-    if show_debug:
-    st.markdown("**Price diagnostics**")
-    st.write({
-        "raw_price_non_na": int(pd.to_numeric(raw[price_col0], errors="coerce").notna().sum()) if price_col0 else 0,
-        "stashed__price__non_na": int(pd.to_numeric(feats_df["__price__"], errors="coerce").notna().sum()),
-        "price_on_X_non_na": int(price_on_X.notna().sum())
-    })
+        if show_debug:
+        st.markdown("**Price diagnostics**")
+        st.write({
+            "raw_price_non_na": int(pd.to_numeric(raw[price_col0], errors="coerce").notna().sum()) if price_col0 else 0,
+            "stashed__price__non_na": int(pd.to_numeric(feats_df["__price__"], errors="coerce").notna().sum()),
+            "price_on_X_non_na": int(price_on_X.notna().sum())
+        })
 
     # (6) Display price: use stashed price on X index (cannot be all NaN after Patch 1)
     price_on_X = pd.to_numeric(feats_df.loc[X.index, "__price__"], errors="coerce")
