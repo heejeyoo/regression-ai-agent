@@ -154,6 +154,18 @@ if st.button("Predict"):
     core_cols = ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]
     feats_df = strict if varscore(strict, core_cols) >= varscore(lenient, core_cols) else lenient
 
+    # --- Stash the exact price used to build features on the SAME index ---
+    price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
+    if price_col is not None:
+        price_used = pd.to_numeric(raw[price_col], errors="coerce").copy()
+        # normalize both to tz-naive daily dates
+        price_used.index = pd.to_datetime(price_used.index, errors="coerce").tz_localize(None).normalize()
+        feats_idx = pd.to_datetime(feats_df.index, errors="coerce").tz_localize(None).normalize()
+        aligned_price = price_used.reindex(feats_idx).ffill().bfill()
+        feats_df["__price__"] = aligned_price.values  # same length/order as feats_df
+    else:
+        feats_df["__price__"] = np.nan
+
     # (3) Event scaffolding
     feats_df = add_event_scaffolding(feats_df)
 
@@ -195,9 +207,12 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Align for display: price derived on the SAME index as X
-    price_on_X = get_display_price(raw, X.index)
-    realized = realized_next_return(price_on_X)
+    # (6) Align for display — use the stashed feature-aligned price
+    price_on_X = pd.to_numeric(feats_df.loc[X.index, "__price__"], errors="coerce")
+    realized = price_on_X.pct_change().shift(-1)
+    
+    if price_on_X.dropna().empty:
+        st.error("Price still empty after stashing. Check YF data availability and logs.")
 
     # (7) Display
     st.subheader(f"Prediction for {ticker}")
