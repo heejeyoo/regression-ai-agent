@@ -1,9 +1,10 @@
-# app.py — robust non-flat features + clean date alignment
+# app.py — robust non-flat predictions with local calibration fallback
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib, yfinance as yf
+from sklearn.linear_model import Ridge
 from utils import compute_indicators  # strict technicals
 
 st.set_page_config(page_title="AI Stock Predictor", layout="wide")
@@ -82,17 +83,13 @@ def build_indicators_lenient(raw: pd.DataFrame) -> pd.DataFrame:
 
     return _as_date_index(df)
 
-def choose_features(strict_df: pd.DataFrame, lenient_df: pd.DataFrame) -> pd.DataFrame:
+def choose_more_variable(strict_df: pd.DataFrame, lenient_df: pd.DataFrame) -> pd.DataFrame:
     core = ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]
-    s = strict_df.copy()
-    if s.empty or len([c for c in core if c in s.columns]) < 3:
-        return lenient_df
-    # variance score: sum of std over available core features
     def varscore(df):
         cols = [c for c in core if c in df.columns]
-        if not cols: return -1.0
+        if not cols or df.empty: return -1.0
         return float(pd.DataFrame({c: df[c].astype(float) for c in cols}).std(ddof=0).sum())
-    return s if varscore(s) >= varscore(lenient_df) else lenient_df
+    return strict_df if varscore(strict_df) >= varscore(lenient_df) else lenient_df
 
 # ---------- UI ----------
 col1, col2 = st.columns([2,1])
@@ -106,10 +103,10 @@ if st.button("Predict"):
     if raw.empty:
         st.error("No price data returned for that ticker/period."); st.stop()
 
-    # Strict first, then lenient, then pick the more variable one
+    # Strict first, lenient fallback; pick the more variable feature set
     strict = compute_indicators(raw)
     lenient = build_indicators_lenient(raw)
-    feats_df = choose_features(strict, lenient)
+    feats_df = choose_more_variable(strict, lenient)
 
     # Load artifacts
     try:
@@ -131,7 +128,7 @@ if st.button("Predict"):
     for c in features:
         if c not in feats_df.columns: feats_df[c] = 0.0
 
-    # Build X: keep technicals as-is; only clean event/text
+    # Build X: keep technicals “as is”; only clean event/text
     core_feats  = [f for f in ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"] if f in features]
     event_feats = [f for f in ["news_vol_z20","sent_jump_z20","is_event_day"] if f in features]
     text_feats  = [f for f in features if f.startswith("topic_") or f.startswith("kw_")]
@@ -147,12 +144,35 @@ if st.button("Predict"):
     if X.empty:
         st.error("No usable rows found. Try a longer history or a different ticker."); st.stop()
 
-    # Warn if features look constant (flat preds likely)
-    nunq = X.nunique()
-    if int(nunq.sum()) <= len(nunq):
-        st.warning("Features look constant; predictions may appear flat. Try a longer window or another ticker.")
-
+    # Predict with the saved model
     preds = model.predict(X)
+    flat = float(np.ptp(preds)) < 1e-8  # range ~0
+
+    # ----- Local calibration fallback if preds are flat -----
+    if flat:
+        try:
+            # Build a small local training set using the same features
+            # Target = next-day return from raw Adj Close
+            px = raw.get("Adj Close", raw.select_dtypes(include="number").iloc[:,0]).astype(float)
+            ret_1d = px.pct_change()
+            target = ret_1d.shift(-1)  # next-day return
+
+            # Align target to X index and drop missing
+            y = target.reindex(X.index)
+            ok = y.notna()
+            Xcal, ycal = X.loc[ok], y.loc[ok]
+
+            # Use recent window to avoid overfitting (e.g., last 504 trading days ~ 2y)
+            if len(Xcal) > 504:
+                Xcal, ycal = Xcal.iloc[-504:], ycal.iloc[-504:]
+
+            if len(Xcal) >= 50:  # need some data
+                ridge = Ridge(alpha=1.0, random_state=42)
+                ridge.fit(Xcal, ycal)
+                preds = ridge.predict(X)
+                st.info("Predictions were flat; applied local Ridge calibration on recent data.")
+        except Exception:
+            pass
 
     # Align price to X index for chart
     price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
@@ -175,10 +195,17 @@ if st.button("Predict"):
     st.metric(label=f"Latest predicted next-day return ({label_date})", value=f"{latest_pred:.2%}")
 
     with st.expander("Debug info"):
+        nunq = X.nunique()
         st.write("Feature rows:", X.shape[0], "Feature cols:", X.shape[1])
-        st.write("Per-feature nunique (min 15):", nunq.sort_values().head(15))
-        st.write("Variance score (strict/lenient):",
-                 float(strict[["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]].std(ddof=0).sum()
-                       if not strict.empty else -1.0),
-                 "/",
-                 float(lenient[["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"]].std(ddof=0).sum()))
+        st.write("Flat-from-model:", flat, "| Pred range:", float(np.ptp(preds)))
+        st.write("Per-feature nunique (min 12):", nunq.sort_values().head(12))
+        core_in = [c for c in core_feats if c in X.columns]
+        if core_in:
+            st.write("Core feature std (sum):", float(X[core_in].std(ddof=0).sum()))
+        try:
+            coef = getattr(model, "coef_", None)
+            if coef is not None and len(coef)==len(features):
+                top = pd.Series(coef, index=features).abs().sort_values(ascending=False).head(10)
+                st.write("Top |coef| (saved model):", top)
+        except Exception:
+            pass
