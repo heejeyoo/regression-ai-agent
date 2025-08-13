@@ -1,4 +1,4 @@
-# app.py — Streamlit app with robust fallbacks to always produce feature rows
+# app.py — Streamlit app with robust date alignment & fallbacks
 
 import streamlit as st
 import pandas as pd
@@ -8,8 +8,19 @@ import yfinance as yf
 from utils import compute_indicators
 
 st.set_page_config(page_title="AI Stock Predictor", layout="wide")
-st.title("📈 AI Stock Prediction App")
+st.title("AI Stock Prediction App")
 st.caption("Educational demo -- not financial advice.")
+
+# ----------------- Helpers -----------------
+def _to_date_index(idx):
+    dt = pd.to_datetime(idx, errors="coerce", utc=True)
+    # tz-naive date index
+    return dt.tz_convert("UTC").tz_localize(None).normalize()
+
+def _as_date_index(df):
+    out = df.copy()
+    out.index = _to_date_index(out.index)
+    return out
 
 # ----------------- Robust Yahoo Finance loader -----------------
 def load_prices_yf(ticker: str, period: str = "2y"):
@@ -50,7 +61,8 @@ def load_prices_yf(ticker: str, period: str = "2y"):
     cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in out.columns]
     if not cols:
         cols = out.select_dtypes(include="number").columns.tolist()
-    return out[cols]
+    out = out[cols]
+    return _as_date_index(out)
 
 # ----------------- UI -----------------
 col1, col2 = st.columns([2,1])
@@ -66,22 +78,20 @@ if st.button("Predict"):
         st.error("No price data returned for that ticker/period.")
         st.stop()
 
-    df = compute_indicators(raw)
+    feats_df = compute_indicators(raw)
 
-    # Fallback: if indicators dropped everything (short window / odd data),
-    # build a minimal feature frame so we always have rows.
-    if df.empty:
+    # Fallback: minimal features if indicators dropped everything
+    if feats_df.empty:
         px = pd.to_numeric(raw.get("Adj Close", raw.select_dtypes("number").iloc[:,0]), errors="coerce")
         tmp = pd.DataFrame(index=raw.index)
         tmp["ret_1d"] = px.pct_change()
-        # simple safe placeholders
         tmp["sma_ratio_10_20"] = 1.0
         tmp["vol_20"] = 0.0
         tmp["rsi_14"] = 50.0
         tmp["macd"] = 0.0
         tmp["macd_signal"] = 0.0
         tmp["vol_z20"] = 0.0
-        df = tmp.fillna(0.0)
+        feats_df = tmp.fillna(0.0)
 
     # 2) Load artifacts produced by training_text.py
     try:
@@ -93,31 +103,33 @@ if st.button("Predict"):
 
     # 3) Recreate training's simple event features (placeholders if no news)
     for c in ("Daily_Sentiment", "News_Volume"):
-        if c not in df.columns:
-            df[c] = 0.0
+        if c not in feats_df.columns:
+            feats_df[c] = 0.0
 
     def zscore(s, w=20):
         return (s - s.rolling(w).mean()) / (s.rolling(w).std() + 1e-9)
 
-    df["news_vol_z20"]  = zscore(df["News_Volume"])
-    df["sent_jump"]     = (df["Daily_Sentiment"] - df["Daily_Sentiment"].shift(1)).fillna(0.0)
-    df["sent_jump_z20"] = zscore(df["sent_jump"])
-    df["is_event_day"]  = ((df["news_vol_z20"] > 1.5) | (df["sent_jump_z20"] > 1.5)).astype(int)
+    feats_df["news_vol_z20"]  = zscore(feats_df["News_Volume"])
+    feats_df["sent_jump"]     = (feats_df["Daily_Sentiment"] - feats_df["Daily_Sentiment"].shift(1)).fillna(0.0)
+    feats_df["sent_jump_z20"] = zscore(feats_df["sent_jump"])
+    feats_df["is_event_day"]  = ((feats_df["news_vol_z20"] > 1.5) | (feats_df["sent_jump_z20"] > 1.5)).astype(int)
 
     # 4) Ensure all expected feature columns exist; fill NaNs/±inf
     for c in features:
-        if c not in df.columns:
-            df[c] = 0.0
+        if c not in feats_df.columns:
+            feats_df[c] = 0.0
 
-    X = (df[features]
+    feats_df = _as_date_index(feats_df)
+
+    X = (feats_df[features]
          .astype(float, errors="ignore")
          .replace([np.inf, -np.inf], np.nan)
          .fillna(method="ffill")
          .fillna(0.0))
 
-    # Final fallback: if still no rows, predict on the latest row only
-    if X.empty and len(df) > 0:
-        X = df.iloc[[-1]][features].astype(float, errors="ignore").replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    # Final fallback: if still no rows, predict on latest row only
+    if X.empty and len(feats_df) > 0:
+        X = feats_df.iloc[[-1]][features].astype(float, errors="ignore").replace([np.inf,-np.inf], np.nan).fillna(0.0)
 
     if X.empty:
         st.error("Still no usable rows to predict. Try a longer history.")
@@ -126,13 +138,20 @@ if st.button("Predict"):
     # 5) Predict next-day returns
     preds = model.predict(X)
 
-    # 6) Chart
+    # 6) Align price to feature index (normalize both to DATE and pad forward)
     price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
-    show_price = raw.loc[X.index, price_col] if price_col else pd.Series(index=X.index, dtype=float)
-    chart = pd.DataFrame(
-        {"Price": show_price, "Predicted next-day return": preds},
-        index=X.index
-    )
+    if price_col:
+        price_series = raw[price_col].astype(float)
+        price_series = price_series.reindex(X.index).fillna(method="ffill").fillna(method="bfill")
+    else:
+        price_series = pd.Series(index=X.index, dtype=float)
+
+    # If price is still all NaN (edge ticker), at least plot predictions
+    chart = pd.DataFrame(index=X.index)
+    if not price_series.dropna().empty:
+        chart["Price"] = price_series
+    chart["Predicted next-day return"] = preds
+
     st.subheader(f"Prediction for {ticker}")
     st.line_chart(chart)
 
@@ -146,5 +165,7 @@ if st.button("Predict"):
 
     with st.expander("Debug info"):
         st.write("Feature rows:", X.shape[0], "Feature cols:", X.shape[1])
-        st.write("First/last prediction index:", X.index[:1], "…", X.index[-1:])
-        st.write("Sample features:", X.head(3))
+        st.write("X index sample:", X.index[:3], "…", X.index[-3:])
+        st.write("Raw index sample:", raw.index[:3], "…", raw.index[-3:])
+        st.write("Has price series:", not price_series.dropna().empty)
+        st.write("First rows of X:", X.head(3))
