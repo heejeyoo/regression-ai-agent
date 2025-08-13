@@ -11,6 +11,45 @@ st.title("📈 AI Stock Predictor — Diagnostics")
 st.caption("Educational demo — not financial advice.")
 
 # ---------- Helpers ----------
+def align_price_to_X(raw: pd.DataFrame, X: pd.DataFrame, price_cols=("Adj Close","Close","Open")) -> pd.Series:
+    """Return a price series aligned to X.index with strong fallbacks."""
+    # 1) Choose a price column
+    raw_price = None
+    for c in price_cols:
+        if c in raw.columns:
+            raw_price = pd.to_numeric(raw[c], errors="coerce")
+            break
+    if raw_price is None:
+        return pd.Series(index=X.index, dtype=float)
+
+    # 2) Normalize both indexes to tz-naive dates
+    rp = raw_price.copy()
+    rp.index = pd.to_datetime(rp.index, errors="coerce")
+    rp = rp[~rp.index.duplicated(keep="last")]
+    rp.index = pd.DatetimeIndex(rp.index.tz_localize(None)).normalize()
+
+    x_idx = pd.to_datetime(X.index, errors="coerce")
+    x_idx = pd.DatetimeIndex(x_idx.tz_localize(None)).normalize()
+
+    # 3) Direct reindex + fills
+    p = rp.reindex(x_idx).ffill().bfill()
+
+    # 4) If still empty, do an as-of merge (map to most recent <= date)
+    if p.dropna().empty:
+        ps = pd.DataFrame({"Date": rp.index, "Price": rp.values}).sort_values("Date")
+        xi = pd.DataFrame({"Date": x_idx}).sort_values("Date")
+        asof = pd.merge_asof(xi, ps, on="Date", direction="backward", tolerance=pd.Timedelta("30D"))
+        p = asof.set_index("Date")["Price"].reindex(x_idx)
+
+        # 5) Last fallback: resample raw to daily then align
+        if p.dropna().empty:
+            daily = rp.asfreq("D").ffill().bfill()
+            p = daily.reindex(x_idx).ffill().bfill()
+
+    # keep X’s original index object (even if it’s PeriodIndex/etc.)
+    p.index = X.index
+    return p
+
 def _to_date_index(idx):
     dt = pd.to_datetime(idx, errors="coerce", utc=True)
     return dt.tz_convert("UTC").tz_localize(None).normalize()
@@ -164,47 +203,16 @@ if st.button("Predict"):
     # (5) Predict
     preds = model.predict(X)
 
-    # (6) Align for display — robust as-of + daily resample fallbacks
-    price_col = next((c for c in ["Adj Close","Close","Open"] if c in raw.columns), None)
-    
-    # default: empty series on X's index
-    price_on_X = pd.Series(index=X.index, dtype=float)
-    
-    if price_col:
-        # Ensure both sides are clean date indexes
-        raw_price = raw[price_col].astype(float).copy()
-        raw_price.index = pd.to_datetime(raw_price.index, errors="coerce").tz_localize(None).normalize()
-    
-        x_idx = pd.to_datetime(X.index, errors="coerce").tz_localize(None).normalize()
-    
-        # 1) Try simple exact-date reindex + fills
-        tmp = raw_price.reindex(x_idx).ffill().bfill()
-    
-        if tmp.dropna().empty:
-            # 2) As-of merge (maps each X date to the most recent raw date <= X date)
-            ps = raw_price.reset_index()
-            ps.columns = ["Date", "Price"]
-            xi = pd.DataFrame({"Date": x_idx})
-            asof = pd.merge_asof(
-                xi.sort_values("Date"),
-                ps.sort_values("Date"),
-                on="Date",
-                direction="backward",
-                tolerance=pd.Timedelta("14D"),
-            )
-            asof.set_index("Date", inplace=True)
-            price_on_X = asof["Price"].reindex(x_idx)
-    
-            if price_on_X.dropna().empty:
-                # 3) Last fallback: daily resample the raw series and align
-                daily = raw_price.asfreq("D").ffill().bfill()
-                price_on_X = daily.reindex(x_idx).ffill().bfill()
-        else:
-            price_on_X = tmp
-    
-    # Realized next-day return from the aligned price series
+    # (6) Align for display — use robust function above
+    price_on_X = align_price_to_X(raw, X)
     realized = price_on_X.pct_change().shift(-1)
-
+    
+    # Guard: if still empty, surface a clear error + tips
+    if price_on_X.dropna().empty:
+        st.error(
+            "Price alignment failed (all NaN after fallbacks). "
+            "Check that raw prices have a datetime index and that features share the same date range."
+        )
 
     # (7) Display
     st.subheader(f"Prediction for {ticker}")
