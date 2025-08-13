@@ -1,13 +1,13 @@
-# app.py — robust alignment + non-flat features
+# app.py — Streamlit app with lenient indicators (no-flat features) + robust alignment
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib, yfinance as yf
-from utils import compute_indicators
+from utils import compute_indicators  # strict version (used first)
 
 st.set_page_config(page_title="AI Stock Predictor", layout="wide")
-st.title("📈 AI Stock Prediction App")
+st.title("AI Stock Prediction App")
 st.caption("Educational demo -- not financial advice.")
 
 # ---------- helpers ----------
@@ -19,8 +19,7 @@ def _as_date_index(df):
     out = df.copy()
     out.index = _to_date_index(out.index)
     out = out[~out.index.duplicated(keep="last")]
-    out = out.sort_index()
-    return out
+    return out.sort_index()
 
 def load_prices_yf(ticker: str, period: str = "5y"):
     df = yf.download(ticker, period=period, interval="1d", auto_adjust=False)
@@ -44,13 +43,53 @@ def load_prices_yf(ticker: str, period: str = "5y"):
     out = pd.DataFrame(index=df.index)
     for c in df.columns:
         s = df[c]
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
+        if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
         out[c] = pd.to_numeric(s.squeeze(), errors="coerce")
     keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in out.columns]
-    if not keep:
-        keep = out.select_dtypes(include="number").columns.tolist()
+    if not keep: keep = out.select_dtypes(include="number").columns.tolist()
     return _as_date_index(out[keep])
+
+def build_indicators_lenient(raw: pd.DataFrame) -> pd.DataFrame:
+    """Always returns varying technicals; no full-drop. Uses min_periods=1 + ewm smoothing."""
+    df = raw.copy()
+    px = df.get("Adj Close")
+    if px is None:
+        px = df.select_dtypes(include="number").iloc[:, 0]
+    px = pd.to_numeric(px, errors="coerce").fillna(method="ffill").fillna(method="bfill")
+
+    # Basic return
+    df["ret_1d"] = px.pct_change().fillna(0.0)
+
+    # SMAs (lenient)
+    sma10 = px.rolling(10, min_periods=2).mean()
+    sma20 = px.rolling(20, min_periods=2).mean()
+    df["sma_ratio_10_20"] = (sma10 / (sma20 + 1e-12)).fillna(1.0)
+
+    # Volatility (lenient)
+    df["vol_20"] = df["ret_1d"].rolling(20, min_periods=2).std().fillna(0.0) * np.sqrt(252)
+
+    # RSI(14) with Wilder-style EWM
+    delta = px.diff().fillna(0.0)
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    roll_up = gain.ewm(alpha=1/14, adjust=False, min_periods=2).mean()
+    roll_down = loss.ewm(alpha=1/14, adjust=False, min_periods=2).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
+
+    # MACD (12,26) + signal(9)
+    ema12 = px.ewm(span=12, adjust=False).mean()
+    ema26 = px.ewm(span=26, adjust=False).mean()
+    df["macd"] = (ema12 - ema26).fillna(0.0)
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean().fillna(0.0)
+
+    # Volume z-score (lenient)
+    vol = pd.to_numeric(df.get("Volume", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0)
+    vmean = vol.rolling(20, min_periods=2).mean()
+    vstd  = vol.rolling(20, min_periods=2).std()
+    df["vol_z20"] = ((vol - vmean) / (vstd + 1e-12)).fillna(0.0)
+
+    return df
 
 # ---------- UI ----------
 col1, col2 = st.columns([2,1])
@@ -60,80 +99,57 @@ with col2:
     period = st.selectbox("History window", ["1y","2y","5y","max"], index=2)
 
 if st.button("Predict"):
-    # 1) Load & indicators
+    # 1) Load prices
     raw = load_prices_yf(ticker, period=period)
     if raw.empty:
         st.error("No price data returned for that ticker/period."); st.stop()
 
+    # 2) Indicators (strict first; lenient fallback)
     feats_df = compute_indicators(raw)
+    if feats_df.empty or feats_df[["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal"]].nunique().sum() <= 5:
+        feats_df = build_indicators_lenient(raw)
     feats_df = _as_date_index(feats_df)
 
-    # If compute_indicators dropped everything (edge case), fallback minimally
-    if feats_df.empty:
-        px = pd.to_numeric(raw.get("Adj Close", raw.select_dtypes("number").iloc[:,0]), errors="coerce")
-        tmp = pd.DataFrame(index=raw.index)
-        tmp["ret_1d"] = px.pct_change()
-        # placeholders retain some variance via ret_1d
-        tmp["sma_ratio_10_20"] = 1.0
-        tmp["vol_20"] = 0.0
-        tmp["rsi_14"] = 50.0
-        tmp["macd"] = 0.0
-        tmp["macd_signal"] = 0.0
-        tmp["vol_z20"] = 0.0
-        feats_df = _as_date_index(tmp.fillna(0.0))
-
-    # 2) Load artifacts
+    # 3) Load artifacts
     try:
         model = joblib.load("artifacts/model.pkl")
         features = joblib.load("artifacts/features.pkl")
     except Exception as e:
         st.error(f"Could not load artifacts: {e}"); st.stop()
 
-    # Split features by type (so we only fill event/text)
+    # 4) Rebuild simple event features (placeholders; only these get zero/ffill)
+    for c in ("Daily_Sentiment","News_Volume"):
+        if c not in feats_df.columns: feats_df[c] = 0.0
+    def zscore(s, w=20): return (s - s.rolling(w).mean()) / (s.rolling(w).std() + 1e-9)
+    feats_df["news_vol_z20"]  = zscore(feats_df["News_Volume"]).fillna(0.0)
+    feats_df["sent_jump"]     = (feats_df["Daily_Sentiment"] - feats_df["Daily_Sentiment"].shift(1)).fillna(0.0)
+    feats_df["sent_jump_z20"] = zscore(feats_df["sent_jump"]).fillna(0.0)
+    feats_df["is_event_day"]  = ((feats_df["news_vol_z20"] > 1.5) | (feats_df["sent_jump_z20"] > 1.5)).astype(int)
+
+    # 5) Ensure all expected feature columns exist
+    for c in features:
+        if c not in feats_df.columns: feats_df[c] = 0.0
+
+    # Build X: keep technicals “as is”, only clean event/text
     core_feats  = [f for f in ["sma_ratio_10_20","vol_20","rsi_14","macd","macd_signal","vol_z20","ret_1d"] if f in features]
     event_feats = [f for f in ["news_vol_z20","sent_jump_z20","is_event_day"] if f in features]
     text_feats  = [f for f in features if f.startswith("topic_") or f.startswith("kw_")]
 
-    # 3) Rebuild simple event features
-    for c in ("Daily_Sentiment","News_Volume"):
-        if c not in feats_df.columns: feats_df[c] = 0.0
-    def zscore(s, w=20): return (s - s.rolling(w).mean()) / (s.rolling(w).std() + 1e-9)
-    feats_df["news_vol_z20"]  = zscore(feats_df["News_Volume"])
-    feats_df["sent_jump"]     = (feats_df["Daily_Sentiment"] - feats_df["Daily_Sentiment"].shift(1)).fillna(0.0)
-    feats_df["sent_jump_z20"] = zscore(feats_df["sent_jump"])
-    feats_df["is_event_day"]  = ((feats_df["news_vol_z20"] > 1.5) | (feats_df["sent_jump_z20"] > 1.5)).astype(int)
-
-    # 4) Ensure all expected columns exist
-    for c in features:
-        if c not in feats_df.columns: feats_df[c] = 0.0
-
-    # Build X:
     X = feats_df[features].copy()
-
-    # Only fill event/text features; keep technicals unfilled to preserve variance
     if event_feats: X[event_feats] = X[event_feats].replace([np.inf,-np.inf], np.nan).fillna(0.0)
     if text_feats:  X[text_feats]  = X[text_feats].replace([np.inf,-np.inf], np.nan).fillna(0.0)
-
-    # Drop rows missing any core technicals
+    # Drop rows missing any core technicals; then forward-fill only remaining holes
     if core_feats:
         X = X.dropna(subset=core_feats)
+        if X.isna().any().any():
+            X[core_feats] = X[core_feats].fillna(method="ffill")
 
-    # If still empty, last fallback: drop only rows where *all* core are NaN, then fill forward
-    if X.empty and core_feats:
-        core_only = feats_df[core_feats].replace([np.inf,-np.inf], np.nan)
-        mask = ~core_only.isna().all(axis=1)
-        X = feats_df.loc[mask, features].copy()
-        X[core_feats] = X[core_feats].fillna(method="ffill")
-        X[event_feats + text_feats] = X[event_feats + text_feats].fillna(0.0)
-        X = X.dropna(subset=core_feats)
-    # Final guard
     if X.empty:
-        st.error("No usable rows found. Try a longer history or a different ticker.")
-        st.stop()
+        st.error("No usable rows found. Try a longer history or a different ticker."); st.stop()
 
-    # 5) Sanity check variance (flat features -> flat preds)
+    # Warn if features are still constant
     nunq = X.nunique()
-    if int(nunq.sum()) <= len(nunq):  # each column has <=1 unique value
+    if int(nunq.sum()) <= len(nunq):
         st.warning("Features look constant; predictions may appear flat. Try a longer window or another ticker.")
 
     # 6) Predict
@@ -153,26 +169,13 @@ if st.button("Predict"):
     st.subheader(f"Prediction for {ticker}")
     st.line_chart(chart)
 
-    # Latest point
     latest_dt = X.index[-1]
     latest_pred = float(preds[-1])
     try: label_date = latest_dt.date()
     except Exception: label_date = str(latest_dt)
     st.metric(label=f"Latest predicted next-day return ({label_date})", value=f"{latest_pred:.2%}")
 
-    # Debug panel
     with st.expander("Debug info"):
         st.write("Feature rows:", X.shape[0], "Feature cols:", X.shape[1])
-        st.write("Missing feature columns:", sorted(set(features) - set(feats_df.columns)))
         st.write("Per-feature nunique (first 15):", nunq.sort_values().head(15))
-        try:
-            coef = getattr(model, "coef_", None)
-            if coef is not None and len(coef)==len(features):
-                top = pd.Series(coef, index=features).abs().sort_values(ascending=False).head(10)
-                st.write("Top |coef| (Ridge):", top)
-            else:
-                fi = getattr(model, "feature_importances_", None)
-                if fi is not None and len(fi)==len(features):
-                    top = pd.Series(fi, index=features).sort_values(ascending=False).head(10)
-                    st.write("Top feature importances (RF):", top)
-        except Exception: pass
+        st.write("X head:", X.head(3))
