@@ -6,28 +6,36 @@ from sklearn.metrics import mean_squared_error
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Normalize expected price column
+    def _one_series(frame: pd.DataFrame, name: str) -> pd.Series:
+        """Return a numeric 1D Series for the given column name, even if duplicates exist."""
+        if name not in frame.columns:
+            raise KeyError(name)
+        obj = frame.loc[:, [name]]
+        s = pd.to_numeric(obj.iloc[:, 0], errors="coerce")
+        s.name = name
+        return s
+
+    # choose price column
     price_col = None
     for candidate in ["Adj Close", "AdjClose", "adj close", "adjclose", "Close", "close"]:
         if candidate in df.columns:
             price_col = candidate
             break
     if price_col is None:
-        # last resort: pick the first numeric column
         num_cols = df.select_dtypes(include=["number"]).columns.tolist()
         if not num_cols:
             raise ValueError("No numeric price column available in DataFrame.")
         price_col = num_cols[0]
 
-    px = df[price_col].astype(float)
+    px = _one_series(df, price_col).astype(float)
 
-    # Basics
+    # basics
     df["ret_1d"] = px.pct_change()
     df["sma_10"] = px.rolling(10).mean()
     df["sma_20"] = px.rolling(20).mean()
     df["sma_ratio_10_20"] = df["sma_10"] / (df["sma_20"] + 1e-12)
 
-    # Volatility (20d)
+    # volatility
     df["vol_20"] = df["ret_1d"].rolling(20).std() * np.sqrt(252)
 
     # RSI(14)
@@ -39,21 +47,26 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = roll_up / (roll_down + 1e-12)
     df["rsi_14"] = 100 - (100 / (1 + rs))
 
-    # MACD (12,26) + signal(9)
+    # MACD
     ema12 = px.ewm(span=12, adjust=False).mean()
     ema26 = px.ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # Volume z-score (20d)
+    # volume z-score
     if "Volume" in df.columns:
-        vol_mean = df["Volume"].rolling(20).mean()
-        vol_std  = df["Volume"].rolling(20).std()
-        df["vol_z20"] = (df["Volume"] - vol_mean) / (vol_std + 1e-12)
+        try:
+            vol = _one_series(df, "Volume")
+        except KeyError:
+            vol = pd.Series(0.0, index=df.index)
+        vol_mean = vol.rolling(20).mean()
+        vol_std  = vol.rolling(20).std()
+        df["vol_z20"] = (vol - vol_mean) / (vol_std + 1e-12)
     else:
         df["vol_z20"] = 0.0
 
     return df.dropna()
+
 
 
 def train_test_split_chrono(df, test_frac=0.2):
