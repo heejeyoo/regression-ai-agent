@@ -1,4 +1,5 @@
-# utils.py  — robust, 1-D safe helpers
+
+# utils.py - robust, 1-D safe helpers
 import numpy as np
 import pandas as pd
 
@@ -8,8 +9,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     - Flattens MultiIndex columns
     - Deduplicates columns (keeps first)
     - Picks price/volume as 1-D Series even if duplicates exist
-    Returns a DataFrame with: ret_1d, sma_10, sma_20, sma_ratio_10_20, vol_20,
-    rsi_14, macd, macd_signal, vol_z20 (plus original OHLCV columns).
+    Returns: ret_1d, sma_10, sma_20, sma_ratio_10_20, vol_20, rsi_14, macd,
+             macd_signal, vol_z20 (plus original OHLCV columns).
     """
     df = df.copy()
 
@@ -49,7 +50,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 5) Volatility (20d, annualized)
     df["vol_20"] = df["ret_1d"].rolling(20, min_periods=20).std() * np.sqrt(252)
 
-    # 6) RSI(14) — use clip instead of np.where to avoid 2-D arrays
+    # 6) RSI(14) - use clip instead of np.where to avoid 2-D arrays
     delta = px.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
@@ -69,11 +70,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol_std  = vol.rolling(20, min_periods=20).std()
     df["vol_z20"] = (vol - vol_mean) / (vol_std + 1e-12)
 
-    # Drop warm-up NaNs from rolling windows
     return df.dropna()
 
 def train_test_split_chrono(df: pd.DataFrame, test_frac: float = 0.2):
-    """Chronological split: last `test_frac` of rows become test."""
+    """Chronological split: last `test_frac` rows become test."""
     n = len(df)
     k = max(1, int(n * test_frac))
     return df.iloc[: n - k].copy(), df.iloc[n - k :].copy()
@@ -86,7 +86,7 @@ def rmse(y_true, y_pred) -> float:
 
 def ci_from_residuals(y_true, y_pred, alpha: float = 0.2):
     """
-    Simple empirical prediction interval from residual quantiles.
+    Empirical prediction interval from residual quantiles.
     Returns (lo_residual, hi_residual) to add to a point prediction.
     """
     resid = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
