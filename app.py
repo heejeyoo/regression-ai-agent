@@ -4,7 +4,7 @@ import joblib, yfinance as yf
 from utils import compute_indicators
 
 st.set_page_config(page_title="AI Stock Predictor", layout="wide")
-st.title("📈 AI Stock Prediction App")
+st.title("AI Stock Prediction App")
 st.caption("Educational demo — not financial advice.")
 
 ticker = st.text_input("Ticker", "TSLA")
