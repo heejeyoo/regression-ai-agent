@@ -19,4 +19,4 @@ try:
     st.subheader("Hold-out Test"); st.dataframe(ts.to_frame("Value").style.format({"Value":"{:.3%}"}))
 except Exception:
     st.info("test_metrics.csv not found.")
-st.caption("Author: Your Name • Course • Semester")
+st.caption("Author: Heeje Yoo • CIS 9660 • Summer 2025")
