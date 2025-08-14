@@ -45,5 +45,5 @@ To run this project on your local machine, please follow these steps:
 
 **1. Clone the Repository**
 ```bash
-git clone [https://github.com/](https://github.com/)[heejeyoo]/[regression-ai-agent].git
-cd [regression-ai-agent]
+git clone [https://github.com/](https://github.com/heejeyoo/regression-ai-agent.git
+cd regression-ai-agent
