@@ -12,7 +12,7 @@ This demonstrates an end-to-end machine learning workflow, from data integration
 
 **You can access the live, deployed application here:**
 
-[https://[regression-ai-agent-apnx6mdtea9hcnmrygkzc4].streamlit.app/](https://regression-ai-agent-apnx6mdtea9hcnmrygkzc4.streamlit.app/)
+[https://regression-ai-agent-apnx6mdtea9hcnmrygkzc4.streamlit.app/](https://regression-ai-agent-apnx6mdtea9hcnmrygkzc4.streamlit.app/)
 
 ## ✨ Features
 
